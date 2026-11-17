@@ -25,4 +25,29 @@ function buildTree(blocks) {
   return root;
 }
 
-module.exports = { buildTree };
+class BudgetError extends Error {}
+
+// Runaway loops against the Discord API mean rate-limit bans, so these caps
+// are enforced rather than advisory.
+function createBudget({ maxIterations = 200, maxMs = 60_000, now = Date.now } = {}) {
+  const started = now();
+  let iterations = 0;
+
+  const clock = () => {
+    if (now() - started > maxMs) {
+      throw new BudgetError(`time budget exceeded (${maxMs / 1000}s)`);
+    }
+  };
+
+  return {
+    clock,
+    iteration() {
+      if (++iterations > maxIterations) {
+        throw new BudgetError(`loop budget exceeded (${maxIterations} iterations)`);
+      }
+      clock();
+    },
+  };
+}
+
+module.exports = { buildTree, createBudget, BudgetError };
