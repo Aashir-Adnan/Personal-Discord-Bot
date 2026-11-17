@@ -25,8 +25,10 @@ name.
   with the rest of the text/file block family.
 - **Cross-server commands.** Every command, sound and store is scoped to one
   guild.
-- **Rollback on failure.** The Discord API offers no transactions. A command
-  that fails halfway leaves its completed effects in place.
+- **True ACID transactions.** The Discord API has no `BEGIN`/`ROLLBACK` and no
+  snapshot. What this design provides instead is a compensating-transaction
+  journal (see *Transactions* below), which is exact for every block except
+  the two named irreversible ones.
 - **A web UI.** Everything happens through Discord interactions.
 
 ## Architecture
@@ -53,9 +55,20 @@ A registry entry:
   kind: 'action',                       // action | block | clause
   params: [{ name: 'user',    type: 'user' },
            { name: 'channel', type: 'channel' }],
-  run: async (ctx, a) => (await ctx.user(a.user)).voice.setChannel(ctx.channel(a.channel)),
+  reversible: true,
+  run: async (ctx, a) => {
+    const member = await ctx.user(a.user);
+    const from = member.voice.channelId;              // captured before the change
+    await member.voice.setChannel(ctx.channel(a.channel));
+    return from && (() => member.voice.setChannel(from));   // the undo
+  },
 }
 ```
+
+A block's `run` returns its own undo closure, or nothing if it changed no
+state. Capturing the prior value inside `run` — rather than in a separate
+`undo` function — keeps the before-state and the change in one place, so they
+cannot drift apart.
 
 `params[].type` drives how the builder collects the value:
 
@@ -81,6 +94,7 @@ One JSON file per guild at `data/<guildId>.json`; uploaded media beside it at
     "chaos": {
       "description": "Pull everyone into the domain",
       "runRole": "everyone",
+      "transactional": true,
       "blocks": [
         { "op": "if",        "args": { "cond": "channel-exists", "channel": "Infinite Mighty" }, "depth": 0 },
         { "op": "foreach",   "args": { "iter": "members-in", "channel": "{caller}" },            "depth": 1 },
@@ -105,6 +119,8 @@ makes unbalanced-`end` bugs structurally impossible, and keeps reordering a
 simple array splice.
 
 `runRole` is one of `"everyone"`, `"manage-guild"`, or a role id string.
+`transactional` is `true` unless the stack contains an irreversible block and
+the author acknowledged the warning at save time.
 
 ## Block vocabulary
 
@@ -194,10 +210,64 @@ walk over that tree, carrying a context and a budget.
   wait for the player to reach `Idle` with a timeout backstop.
 - **Per-guild run lock.** Prevents two concurrent runs fighting over the single
   voice connection. A second invocation is refused with a message.
-- **Failures inside `foreach` do not abort the loop.** One un-moveable member
-  must not kill the run; failures are counted and reported in the summary.
-- **Failures outside a loop abort the run**, reporting which block number
-  failed. Completed effects are not undone.
+- **Failures inside `foreach` do not abort the loop and do not roll back.** One
+  un-moveable member is a partial outcome, not a command failure; failures are
+  counted and reported in the summary, as `/domain-expansion` does today.
+- **Any other failure aborts the run and triggers rollback** — a vanished
+  channel, a revoked permission, a budget breach, an API 5xx.
+
+## Transactions
+
+Every run carries a **journal**. As each block executes, the undo closure
+returned by its `run` is pushed on. On abort, the interpreter walks the journal
+in reverse and invokes each undo, then reports what was rolled back.
+
+Reversibility by block:
+
+| Block | Undo | Fidelity |
+|---|---|---|
+| `join` | leave voice | exact |
+| `leave` | rejoin the recorded channel | exact |
+| `move-user`, `move-all` | return each member to their recorded channel | exact, if still connected |
+| `create-vc` | delete it — only when *this run* created it, never when get-or-create found an existing one | exact |
+| `wait`, `play` | none; no state changed | n/a |
+| `delete-vc` | — | **irreversible**: a recreated channel has a new id |
+| `kick-voice` | — | **irreversible**: a user cannot be forced to reconnect |
+
+### The transactional flag
+
+Commands are transactional by default. The save-time validator scans for
+blocks marked `reversible: false` — today exactly `delete-vc` and
+`kick-voice` — and if any are present, saving requires an explicit
+acknowledgement that stores `transactional: false` on the command:
+
+```
+⚠ This command contains blocks that cannot be undone:
+    #4 kick voice: {it}
+  Saving marks /chaos NON-TRANSACTIONAL. A mid-run failure
+  will leave partial effects in place.
+  [ Save anyway ]  [ Cancel ]
+```
+
+A non-transactional run keeps no journal and performs no rollback. Its reply
+says so explicitly, so the weaker guarantee is visible at the moment it
+matters rather than buried in the command's definition.
+
+### When rollback itself fails
+
+Undoing is ordinary API work and can fail on its own — a member disconnected
+before they could be moved back, a channel was deleted by a human mid-run. An
+undo failure never aborts the rollback: the remaining undos still run, and
+every failure is collected and reported together.
+
+```
+Run failed at block #5 (channel "Infinite Mighty" not found).
+Rolled back 4 blocks. 1 could not be undone:
+  · adnan left voice before being returned to General
+```
+
+This is the one place the guarantee is genuinely best-effort, and the reply
+always says which parts held.
 
 ### Safety caps
 
@@ -230,11 +300,13 @@ written.
 | Failure | Handling |
 |---|---|
 | Invalid stack at save | Reject with block number + reason, write nothing |
-| Missing sound file at runtime | Abort run, name the sound |
-| Missing permission on a block | Abort run, name the permission and channel |
-| Budget exceeded | Abort run, report which cap |
-| Deleted channel referenced | Abort run, name the reference |
-| Per-member move failure in a loop | Counted, reported, loop continues |
+| Missing sound file at runtime | Abort + rollback, name the sound |
+| Missing permission on a block | Abort + rollback, name the permission and channel |
+| Budget exceeded | Abort + rollback, report which cap |
+| Deleted channel referenced | Abort + rollback, name the reference |
+| Per-member move failure in a loop | Counted, reported, loop continues, **no rollback** |
+| Undo fails during rollback | Remaining undos still run; all failures reported together |
+| Failure in a non-transactional command | Abort, no rollback, reply states the command was non-transactional |
 | Command registration rejected | Nothing was written yet; Discord's error surfaced |
 
 ## Testing
@@ -247,7 +319,20 @@ guild objects; no Discord connection. The logic worth testing is all pure:
 2. **Budget caps** — iteration and wall-clock limits trip and throw.
 3. **Condition evaluation** — each condition against stubbed guild state.
 4. **Save validator** — rejects depth jumps, orphan `else`, missing params,
-   unknown sounds, over-cap stacks.
+   unknown sounds, over-cap stacks; flags irreversible blocks.
+5. **Rollback** — the heart of the transaction guarantee, and the part most
+   likely to break silently:
+   - undos replay in reverse order of execution;
+   - a mid-run failure restores every member to their recorded channel;
+   - `create-vc` undo deletes a channel the run created, and leaves an
+     existing one it merely found;
+   - a failing undo does not stop the remaining undos, and every failure is
+     reported;
+   - a tolerated per-member loop failure triggers no rollback at all;
+   - a non-transactional command keeps no journal.
+
+Rollback is tested with a stub guild whose API calls can be made to fail on
+demand, so each failure path is exercised deliberately rather than hoped for.
 
 The one-line discord.js calls inside each block's `run` are not mocked; their
 value is in integration, not unit tests.
@@ -277,3 +362,7 @@ only once the seeded version is verified working against a live server.
   human editing speed; worth batching if it ever becomes a problem.
 - **A command that deletes the channel it is running in** is possible to build.
   The run aborts with an API error, which is acceptable for v1.
+- **Rollback is not instantaneous.** Members really are moved, then really
+  moved back, and both are visible in the server while it happens. The end
+  state is correct; the intermediate state is not hidden, because the Discord
+  API cannot hide it.
