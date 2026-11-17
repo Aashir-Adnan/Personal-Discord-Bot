@@ -1,0 +1,19 @@
+{
+  "name": "personal-discord-bot",
+  "version": "1.0.0",
+  "description": "Joins the invoker's voice channel, plays a sound, then moves everyone to a target channel",
+  "main": "index.js",
+  "scripts": {
+    "deploy": "node deploy-commands.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@discordjs/voice": "^0.19.2",
+    "@noble/ciphers": "^1.3.0",
+    "discord.js": "^14.22.0",
+    "dotenv": "^16.4.5",
+    "ffmpeg-static": "^5.2.0",
+    "libsodium-wrappers": "^0.8.4",
+    "opusscript": "^0.0.8"
+  }
+}
