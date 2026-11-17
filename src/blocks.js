@@ -179,4 +179,71 @@ const BLOCKS = {
   'repeat':  { label: 'Repeat',   kind: 'block',  reversible: true, params: [{ name: 'count', type: 'number' }] },
 };
 
-module.exports = { BLOCKS, voiceMembers };
+// Conditions feed `if`. A reference that resolves to nothing is false rather
+// than an error: asking "is this channel empty" about a channel that does not
+// exist has a sensible answer.
+const CONDITIONS = {
+  'channel-exists': {
+    label: 'channel exists',
+    params: [{ name: 'name', type: 'text' }],
+    test: async (ctx, a) =>
+      [...ctx.guild.channels.cache.values()].some((c) => c.isVoiceBased() && c.name === a.name),
+  },
+
+  'channel-empty': {
+    label: 'channel is empty',
+    params: [{ name: 'channel', type: 'channel' }],
+    test: async (ctx, a) => {
+      const channel = await ctx.channel(a.channel);
+      return channel ? channel.members.size === 0 : false;
+    },
+  },
+
+  'member-in-voice': {
+    label: 'member is in voice',
+    params: [{ name: 'user', type: 'user' }],
+    test: async (ctx, a) => {
+      const member = await ctx.member(a.user);
+      return Boolean(member && member.voice.channelId);
+    },
+  },
+
+  'user-has-role': {
+    label: 'user has role',
+    params: [{ name: 'user', type: 'user' }, { name: 'role', type: 'role' }],
+    test: async (ctx, a) => {
+      const member = await ctx.member(a.user);
+      return Boolean(member && member.roles.cache.has(a.role));
+    },
+  },
+
+  'member-count-at-least': {
+    label: 'member count at least',
+    params: [{ name: 'channel', type: 'channel' }, { name: 'n', type: 'number' }],
+    test: async (ctx, a) => {
+      const channel = await ctx.channel(a.channel);
+      return channel ? channel.members.size >= Number(a.n) : false;
+    },
+  },
+};
+
+// Iterators feed `foreach`; each yields an array bound to {it} one at a time.
+const ITERATORS = {
+  'members-in': {
+    label: 'each member in',
+    params: [{ name: 'channel', type: 'channel' }],
+    items: async (ctx, a) => {
+      const channel = await ctx.channel(a.channel);
+      return channel ? [...channel.members.values()] : [];
+    },
+  },
+
+  'voice-channels': {
+    label: 'each voice channel',
+    params: [],
+    items: async (ctx) =>
+      [...ctx.guild.channels.cache.values()].filter((c) => c.isVoiceBased()),
+  },
+};
+
+module.exports = { BLOCKS, CONDITIONS, ITERATORS, voiceMembers };
